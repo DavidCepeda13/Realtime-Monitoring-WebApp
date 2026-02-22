@@ -38,7 +38,7 @@ from .models import (
 )
 from realtimeMonitoring import settings
 import dateutil.relativedelta
-from django.db.models import Avg, Max, Min, Sum
+from django.db.models import Avg, Max, Min, Sum, Count
 
 
 class DashboardView(TemplateView):
@@ -770,3 +770,82 @@ Filtro para formatear datos en los templates
 @register.filter
 def add_str(str1, str2):
     return str1 + str2
+
+
+"""
+Endpoint para obtener estadísticas por ciudad con mediciones
+Retorna estadísticas detalladas por ciudad con máximos y mínimos de cada medición.
+Optimizado para TimescaleDB.
+"""
+@csrf_exempt
+def get_database_statistics(request):
+    """
+    Endpoint que retorna estadísticas por ciudad con todas las mediciones.
+    Para cada ciudad muestra:
+    - Total de datos registrados
+    - Cantidad de estaciones
+    - Mediciones con count, average, min, max
+    
+    Optimizado para TimescaleDB: usa los valores agregados min_value, max_value, avg_value
+    que ya están precalculados en la base de datos.
+    """
+    try:
+        # Estadísticas detalladas por ciudad con mediciones
+        city_statistics = []
+        cities = City.objects.all()
+        
+        for city in cities:
+            locations = Location.objects.filter(city=city)
+            stations = Station.objects.filter(location__in=locations, active=True)
+            
+            # Obtener todas las mediciones para esta ciudad
+            measurements_data = []
+            measurements = Measurement.objects.filter(active=True)
+            
+            for measurement in measurements:
+                data_queryset = Data.objects.filter(
+                    station__in=stations,
+                    measurement=measurement
+                )
+                
+                if data_queryset.exists():
+                    # TimescaleDB ya tiene agregados los valores en min_value, max_value, avg_value
+                    # Pero necesitamos el mínimo de los mínimos y máximo de los máximos
+                    agg = data_queryset.aggregate(
+                        count=Count('time'),
+                        avg_of_avgs=Avg('avg_value'),
+                        min_val=Min('min_value'),
+                        max_val=Max('max_value')
+                    )
+                    
+                    measurements_data.append({
+                        'measurement': measurement.name,
+                        'unit': measurement.unit,
+                        'count': agg['count'],
+                        'average': round(agg['avg_of_avgs'], 2) if agg['avg_of_avgs'] else None,
+                        'min': int(agg['min_val']) if agg['min_val'] is not None else None,
+                        'max': int(agg['max_val']) if agg['max_val'] is not None else None
+                    })
+            
+            # Solo agregar la ciudad si tiene datos
+            if measurements_data:
+                total_data_count = Data.objects.filter(station__in=stations).count()
+                city_statistics.append({
+                    'city': city.name,
+                    'total_data_count': total_data_count,
+                    'stations_count': stations.count(),
+                    'measurements': measurements_data
+                })
+        
+        # Ordenar por cantidad total de datos (descendente)
+        city_statistics = sorted(city_statistics, key=lambda x: x['total_data_count'], reverse=True)
+        
+        return JsonResponse({
+            'statistics_by_city': city_statistics
+        }, status=200)
+        
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Error al obtener estadísticas: {str(e)}'
+        }, status=500)
